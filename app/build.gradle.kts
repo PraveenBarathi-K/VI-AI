@@ -37,6 +37,10 @@ android {
     buildFeatures {
         viewBinding = true
     }
+    androidResources {
+        noCompress += listOf("midas_model.tflite", "yolov8n.tflite")
+    }
+
 }
 
 dependencies {
