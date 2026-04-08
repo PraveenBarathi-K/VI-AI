@@ -1,9 +1,15 @@
 package com.surendramaran.yolov8tflite
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.*
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
@@ -14,22 +20,26 @@ import androidx.core.content.ContextCompat
 import com.surendramaran.yolov8tflite.Constants.LABELS_PATH
 import com.surendramaran.yolov8tflite.Constants.MODEL_PATH
 import com.surendramaran.yolov8tflite.databinding.ActivityMainBinding
+import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-class MainActivity : AppCompatActivity(), Detector.DetectorListener, DepthEstimator.DepthListener {
+class MainActivity : AppCompatActivity(), Detector.DetectorListener, DepthEstimator.DepthListener, SensorEventListener, TextToSpeech.OnInitListener {
     private lateinit var binding: ActivityMainBinding
-    private val isFrontCamera = false
-
-    private var preview: Preview? = null
-    private var imageAnalyzer: ImageAnalysis? = null
-    private var cameraProvider: ProcessCameraProvider? = null
-
     private var detector: Detector? = null
     private var depthEstimator: DepthEstimator? = null
+    private var tts: TextToSpeech? = null
 
+    // Sensors and Fusion
+    private lateinit var sensorManager: SensorManager
+    private var accelerometer: Sensor? = null
+    private val metricScaler = MetricScaler()
+    private var currentMetricScale = 1.5f
+
+    private var latestDetections: List<BoundingBox> = emptyList()
     private var frameCounter = 0
     private lateinit var cameraExecutor: ExecutorService
+    private var lastUtteranceTime = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,186 +47,200 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener, DepthEstima
         setContentView(binding.root)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
+        tts = TextToSpeech(this, this)
 
-        // Sync-safe Initialization: Wait for models to load before starting camera
+        // Setup Sensors
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+
+        // Initialize Models then Camera
         cameraExecutor.execute {
             try {
-                // Initialize YOLO
                 detector = Detector(baseContext, MODEL_PATH, LABELS_PATH, this)
-
-                // Initialize MiDaS (Ensure this file is in your assets folder)
                 depthEstimator = DepthEstimator(baseContext, "midas_model.tflite", this)
-
-                // Only start camera on UI thread once models are ready
                 runOnUiThread {
-                    if (allPermissionsGranted()) {
-                        startCamera()
-                    } else {
-                        requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-                    }
+                    if (allPermissionsGranted()) startCamera()
+                    else requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "FATAL: Model loading failed. Check assets! ${e.message}")
+                Log.e(TAG, "Init Error: ${e.message}")
             }
         }
-
         bindListeners()
     }
 
     private fun bindListeners() {
-        binding.isGpu.setOnCheckedChangeListener { buttonView, isChecked ->
-            cameraExecutor.submit {
-                detector?.restart(isGpu = isChecked)
-            }
+        binding.isGpu.setOnCheckedChangeListener { _, isChecked ->
+            cameraExecutor.submit { detector?.restart(isGpu = isChecked) }
             val color = if (isChecked) R.color.orange else R.color.gray
-            buttonView.setBackgroundColor(ContextCompat.getColor(baseContext, color))
+            binding.isGpu.setBackgroundColor(ContextCompat.getColor(baseContext, color))
         }
     }
 
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            cameraProvider = cameraProviderFuture.get()
-            bindCameraUseCases()
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun bindCameraUseCases() {
-        val cameraProvider = cameraProvider ?: return
-        val rotation = binding.viewFinder.display.rotation
-
-        val cameraSelector = CameraSelector.Builder()
-            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
-            .build()
-
-        preview = Preview.Builder()
-            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-            .setTargetRotation(rotation)
-            .build()
-
-        imageAnalyzer = ImageAnalysis.Builder()
-            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setTargetRotation(rotation)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-            .build()
-
-        imageAnalyzer?.setAnalyzer(cameraExecutor) { imageProxy ->
-            // Safety Guard: If models aren't ready yet or are closing, skip frame
-            val currentDetector = detector
-            val currentDepth = depthEstimator
-
-            if (currentDetector == null || currentDepth == null) {
-                imageProxy.close()
-                return@setAnalyzer
-            }
-
-            val bitmapBuffer = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
-            imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-
-            val matrix = Matrix().apply {
-                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-            }
-
-            val rotatedBitmap = Bitmap.createBitmap(bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height, matrix, true)
-
-            // 1. YOLO Detection (Every frame)
-            currentDetector.detect(rotatedBitmap)
-
-            // 2. MiDaS Depth (Every 5th frame to maintain high FPS)
-            if (frameCounter % 5 == 0) {
-                currentDepth.estimate(rotatedBitmap)
-            }
-            frameCounter++
-
-            imageProxy.close()
-        }
-
-        cameraProvider.unbindAll()
-        try {
-            cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
-            preview?.setSurfaceProvider(binding.viewFinder.surfaceProvider)
-        } catch (exc: Exception) {
-            Log.e(TAG, "Use case binding failed", exc)
+    // --- Sensor Logic ---
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (event?.sensor?.type == Sensor.TYPE_LINEAR_ACCELERATION) {
+            currentMetricScale = metricScaler.getStableScale(event.values, event.timestamp)
         }
     }
 
-    // --- YOLO Callbacks ---
-    override fun onEmptyDetect() {
-        runOnUiThread { binding.overlay.clear() }
-    }
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) {
-        runOnUiThread {
-            binding.inferenceTime.text = "${inferenceTime}ms"
-            binding.overlay.apply {
-                setResults(boundingBoxes)
-                invalidate()
-            }
-        }
-    }
-
-    // --- MiDaS Depth Callback ---
+    // --- Hybrid Depth Logic ---
     override fun onDepthMapGenerated(depthMap: Array<FloatArray>, inferenceTime: Long) {
-        // Safety check to ensure activity is still active
         if (isFinishing || isDestroyed) return
-
         val size = depthMap.size
         val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
 
-        // Find min/max for normalization (Heatmap Contrast)
-        var minVal = Float.MAX_VALUE
-        var maxVal = Float.MIN_VALUE
+        var maxDepthVal = 0f
+        var hazardX = 0
+        var hazardY = 0
+
+        // Find min/max for dynamic heatmap normalization
+        var mapMin = Float.MAX_VALUE
+        var mapMax = Float.MIN_VALUE
         for (row in depthMap) {
             for (v in row) {
-                if (v < minVal) minVal = v
-                if (v > maxVal) maxVal = v
+                if (v < mapMin) mapMin = v
+                if (v > mapMax) mapMax = v
             }
         }
-        val range = maxVal - minVal
+        val range = mapMax - mapMin
 
         for (y in 0 until size) {
             for (x in 0 until size) {
-                val normalized = if (range > 0) {
-                    (((depthMap[y][x] - minVal) / range) * 255).toInt().coerceIn(0, 255)
-                } else 0
+                val rawVal = depthMap[y][x]
 
-                // Heatmap: Red (Close) to Blue (Far)
-                bitmap.setPixel(x, y, Color.rgb(normalized, 0, 255 - normalized))
+                // Scan walking path (Y-axis 30% to 85%)
+                if (y in (size * 0.3).toInt()..(size * 0.85).toInt()) {
+                    if (rawVal > maxDepthVal) {
+                        maxDepthVal = rawVal
+                        hazardX = x
+                        hazardY = y
+                    }
+                }
+
+                val norm = if (range > 0f) (((rawVal - mapMin) / range) * 255).toInt().coerceIn(0, 255) else 0
+                bitmap.setPixel(x, y, Color.rgb(norm, 0, 255 - norm))
             }
         }
 
+        // Distance Calculation: Uses Inverse Scale to keep it realistic
+        val distance = (1.05f - ( (maxDepthVal - mapMin) / (range + 0.001f) )) * currentMetricScale * 3.0f
+
+        // Semantic Check: Is this depth hazard inside a YOLO detection?
+        var objectLabel = "Obstacle"
+        for (box in latestDetections) {
+            val bx = (box.x1 * size).toInt()
+            val by = (box.y1 * size).toInt()
+            val bw = (box.w * size).toInt()
+            val bh = (box.h * size).toInt()
+            if (hazardX in bx..(bx + bw) && hazardY in by..(by + bh)) {
+                objectLabel = box.clsName
+                break
+            }
+        }
+
+        val side = when {
+            hazardX < size / 3 -> "Left"
+            hazardX < 2 * size / 3 -> "Center"
+            else -> "Right"
+        }
+
         runOnUiThread {
-            binding.depthOverlay.visibility = View.VISIBLE
             binding.depthOverlay.setImageBitmap(bitmap)
+
+            // Alert Threshold: If normalized value is high (closer)
+            val normalizedHazard = if (range > 0f) (maxDepthVal - mapMin) / range else 0f
+
+            if (normalizedHazard > 0.75f) {
+                val message = "$objectLabel $side, ${String.format("%.1f", distance.coerceAtLeast(0.5f))} meters"
+                binding.inferenceTime.text = "STOP: $message"
+                binding.inferenceTime.setTextColor(Color.RED)
+
+                if (System.currentTimeMillis() - lastUtteranceTime > 3500) {
+                    tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, null)
+                    lastUtteranceTime = System.currentTimeMillis()
+                }
+            } else {
+                binding.inferenceTime.text = "PATH CLEAR"
+                binding.inferenceTime.setTextColor(Color.GREEN)
+            }
         }
     }
 
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    // --- Camera Pipeline ---
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+            val preview = Preview.Builder().build()
+            val rotation = binding.viewFinder.display.rotation
+
+            val imageAnalyzer = ImageAnalysis.Builder()
+                .setTargetRotation(rotation)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+
+            imageAnalyzer.setAnalyzer(cameraExecutor) { image ->
+                val d = detector
+                val de = depthEstimator
+                if (d == null || de == null) {
+                    image.close()
+                    return@setAnalyzer
+                }
+
+                val bitmap = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                image.use { bitmap.copyPixelsFromBuffer(image.planes[0].buffer) }
+
+                val matrix = Matrix().apply { postRotate(image.imageInfo.rotationDegrees.toFloat()) }
+                val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+
+                d.detect(rotated)
+                if (frameCounter % 12 == 0) de.estimate(rotated)
+                frameCounter++
+                image.close()
+            }
+
+            cameraProvider.unbindAll()
+            cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalyzer)
+            preview.setSurfaceProvider(binding.viewFinder.surfaceProvider)
+        }, ContextCompat.getMainExecutor(this))
     }
 
-    private val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        if (it[Manifest.permission.CAMERA] == true) startCamera()
+    override fun onInit(status: Int) { if (status == TextToSpeech.SUCCESS) tts?.language = Locale.US }
+    override fun onEmptyDetect() { latestDetections = emptyList() ; runOnUiThread { binding.overlay.clear() } }
+    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) {
+        latestDetections = boundingBoxes
+        runOnUiThread {
+            binding.overlay.setResults(boundingBoxes)
+            binding.overlay.invalidate()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        accelerometer?.also { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) }
+        if (allPermissionsGranted() && detector != null) startCamera()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        sensorManager.unregisterListener(this)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         detector?.close()
         depthEstimator?.close()
+        tts?.shutdown()
         cameraExecutor.shutdown()
     }
 
-    override fun onResume() {
-        super.onResume()
-        // If models are ready, start camera. If not, onCreate's executor handles it.
-        if (allPermissionsGranted() && detector != null && depthEstimator != null) {
-            startCamera()
-        }
-    }
 
-    companion object {
-        private const val TAG = "Camera"
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
-    }
+
+    private fun allPermissionsGranted() = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+    private val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { if (it[Manifest.permission.CAMERA] == true) startCamera() }
+    companion object { private const val TAG = "Camera" ; private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA) }
 }

@@ -23,8 +23,7 @@ class DepthEstimator(
     init {
         try {
             val options = Interpreter.Options().apply {
-                setNumThreads(4)
-                setUseNNAPI(true)
+                addDelegate(org.tensorflow.lite.gpu.GpuDelegate())
             }
             interpreter = Interpreter(FileUtil.loadMappedFile(context, modelPath), options)
         } catch (e: Exception) {
